@@ -48,6 +48,7 @@ export default function ResultPage({ onRetake }) {
 
   const score = Number(report.total_score ?? 0)
   const stage = report.stage_text ?? ''
+  const imageSrc = report.image_b64 ? 'data:image/jpeg;base64,' + report.image_b64 : ''
   const summary = report.one_line_summary ?? ''
   const fullReport = report.full_report ?? ''
   const insights = Array.isArray(report.key_insights) ? report.key_insights : []
@@ -79,9 +80,24 @@ export default function ResultPage({ onRetake }) {
   return (
     <div className="hl-container">
       <header className="hl-header">
-        <div className="hl-brand">HairLens<span> AI</span></div>
+        <div className="hl-brand">HairLens</div>
         <div className="hl-meta">{dateStr}</div>
       </header>
+
+      {imageSrc && (
+        <section className="hl-snapshot hl-fade-in">
+          <img
+            src={imageSrc}
+            alt="측정 스냅샷"
+            style={{
+              width: '100%',
+              borderRadius: 12,
+              display: 'block',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.15)',
+            }}
+          />
+        </section>
+      )}
 
       <section className="hl-hero hl-fade-in">
         <div className="hl-hero-label">종합 진행도</div>

@@ -1,232 +1,172 @@
 import { useEffect, useRef, useState } from 'react'
 import { useHairLensSocket } from '../hooks/useHairLensSocket.js'
+import { buildReport, STORAGE_KEY } from '../data.js'
 
-const SEVERITY_GRADIENTS = {
-  0: 'linear-gradient(90deg, #00ffc8, #00c8ff)',
-  1: 'linear-gradient(90deg, #00c8ff, #ffd400)',
-  2: 'linear-gradient(90deg, #ffd400, #ff9d00)',
-  3: 'linear-gradient(90deg, #ff9d00, #ff3d5a)',
+const WS_URL = 'ws://localhost:8765'
+
+function serializeSurvey(d) {
+  if (!d) return {}
+  return {
+    gender: d.gender ?? null,
+    hasFamilyHairLoss: d.hasFamilyHairLoss ?? null,
+    family: d.family instanceof Set ? [...d.family] : (Array.isArray(d.family) ? d.family : []),
+    hasMedication: d.hasMedication ?? null,
+    hairTypes: d.hairTypes instanceof Set ? [...d.hairTypes] : (Array.isArray(d.hairTypes) ? d.hairTypes : []),
+  }
 }
 
-const STATUS_LABELS = {
-  connected: 'STREAMING',
-  connecting: 'CONNECTING',
-  error: 'ERROR',
-  '': 'DISCONNECTED',
-}
+export default function StreamingPage({ data, score, onPrev, onNext }) {
+  const { status, frameSrc, lastSaved, auto, requestAIReport, connect } = useHairLensSocket()
+  const [aiBuilding, setAiBuilding] = useState(false)
+  const progress = Math.max(0, Math.min(1, auto?.progress ?? 0))
+  const progressPct = Math.round(progress * 100)
+  const navigatedRef = useRef(false)
+  const frameSrcRef  = useRef(null)
+  const connectedOnceRef = useRef(false)
 
-export default function StreamingPage({ onPrev, onNext }) {
-  const [url, setUrl] = useState('ws://localhost:8765')
-  const fpsCanvasRef = useRef(null)
-  const { status, frameSrc, fps, fpsHistory, detections, logs, connect, disconnect } = useHairLensSocket()
-
-  // FPS 그래프 그리기
+  // 페이지 진입 즉시 자동 연결
   useEffect(() => {
-    const canvas = fpsCanvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    canvas.width = 284
-    canvas.height = 56
+    if (connectedOnceRef.current) return
+    connectedOnceRef.current = true
+    connect(WS_URL)
+  }, [connect])
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    const max = Math.max(...fpsHistory, 30)
-    const w = canvas.width / fpsHistory.length
+  useEffect(() => { frameSrcRef.current = frameSrc }, [frameSrc])
 
-    ctx.beginPath()
-    ctx.moveTo(0, canvas.height)
-    fpsHistory.forEach((v, i) => {
-      ctx.lineTo(i * w, canvas.height - (v / max) * canvas.height * 0.85)
-    })
-    ctx.lineTo(canvas.width, canvas.height)
-    ctx.closePath()
-    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height)
-    grad.addColorStop(0, 'rgba(0,200,255,0.3)')
-    grad.addColorStop(1, 'rgba(0,200,255,0.02)')
-    ctx.fillStyle = grad
-    ctx.fill()
+  // 자동 캡처 응답 → AI 리포트 요청 → 페이지 이동 (실패 시 로컬 폴백)
+  useEffect(() => {
+    if (!lastSaved || navigatedRef.current) return
 
-    ctx.beginPath()
-    fpsHistory.forEach((v, i) => {
-      const x = i * w
-      const y = canvas.height - (v / max) * canvas.height * 0.85
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-    })
-    ctx.strokeStyle = 'rgba(0,200,255,0.9)'
-    ctx.lineWidth = 1.5
-    ctx.stroke()
-  }, [fpsHistory])
+    let imageB64 = lastSaved.image_b64 || ''
+    if (!imageB64 && frameSrcRef.current) {
+      const m = String(frameSrcRef.current).match(/^data:image\/[^;]+;base64,(.*)$/)
+      if (m) imageB64 = m[1]
+    }
+    if (!imageB64) return
 
-  const d0 = detections[0] || null
-  const faceCount = detections.length
-  const totalPts = detections.reduce((s, d) => s + (d.hairline_points || 0), 0)
-  const avgConf = detections.length
-    ? detections.reduce((s, d) => s + (d.confidence || 0), 0) / detections.length
-    : null
+    navigatedRef.current = true
+    const measurement = { ...lastSaved, image_b64: imageB64 }
 
-  let foreheadStr = '—'
-  if (d0) {
-    if (d0.forehead_mm != null && d0.forehead_mm > 0) foreheadStr = d0.forehead_mm.toFixed(1) + ' mm'
-    else if (d0.forehead_px > 0) foreheadStr = Math.round(d0.forehead_px) + ' px'
-  }
+    ;(async () => {
+      setAiBuilding(true)
+      const survey = serializeSurvey(data)
+      // image_b64은 토큰 낭비라 AI 요청에선 제외
+      const measurementForAI = { ...measurement }
+      delete measurementForAI.image_b64
 
-  const hairlinePos = d0 && d0.hairline_y_normalized != null ? d0.hairline_y_normalized : null
-  const hairlinePct = hairlinePos != null ? Math.round(hairlinePos * 100) : null
+      let report = null
+      try {
+        const ai = await requestAIReport(survey, measurementForAI)
+        if (ai && typeof ai === 'object') {
+          report = { ...ai, image_b64: imageB64, _meta: { ...(ai._meta || {}), source: 'claude', survey_score: score } }
+        }
+      } catch (e) {
+        console.warn('AI 리포트 요청 오류', e)
+      }
+      if (!report) {
+        // 폴백: 로컬 빌드
+        try {
+          report = buildReport(data, score, measurement)
+          report._meta = { ...(report._meta || {}), source: 'local-fallback' }
+        } catch (e) {
+          console.warn('local report build failed', e)
+        }
+      }
 
-  let severityPct = 0
-  let severityGrad = SEVERITY_GRADIENTS[0]
-  if (d0 && d0.forehead_ratio != null) {
-    severityPct = Math.max(0, Math.min(100, Math.round(((d0.forehead_ratio - 0.4) / 0.6) * 100)))
-    severityGrad = SEVERITY_GRADIENTS[d0.severity_level] || SEVERITY_GRADIENTS[0]
-  }
-
-  const isConnected = status === 'connected'
-  const isConnecting = status === 'connecting'
+      try {
+        if (report) {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(report))
+          if (typeof window !== 'undefined') window.__REPORT__ = report
+        }
+      } catch (e) {
+        console.warn('report persist failed', e)
+      }
+      setAiBuilding(false)
+      onNext && onNext()
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastSaved])
 
   return (
     <div className="card">
       <h1>3단계 · 카메라 분석</h1>
-      <p className="subtitle">실시간 헤어라인 분석을 시작합니다. 서버가 실행 중이어야 합니다.</p>
+      <p className="subtitle">얼굴을 가이드 안에 1초 동안 정렬하면 자동 촬영 후 리포트로 이동합니다.</p>
 
-      <div style={{ marginBottom: 28 }}>
+      <div style={{ marginBottom: 28, position: 'relative' }}>
         <div className="cam-frame">
           {frameSrc ? (
             <img className="cam-feed" src={frameSrc} alt="HairLens stream" />
           ) : (
             <div className="cam-idle">
               <div className="cam-spinner" />
-              <div>{url} 대기 중<br />서버를 실행한 뒤 CONNECT를 누르세요</div>
+              <div>
+                {status === 'error'
+                  ? '서버 연결 실패 — python server.py 실행 중인지 확인해주세요'
+                  : '카메라 연결 중…'}
+              </div>
             </div>
           )}
         </div>
-      </div>
 
-      <div style={{ marginBottom: 28 }}>
-        <div className="connect-row">
-          <input
-            type="text"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            disabled={isConnected || isConnecting}
-          />
-          <button
-            className="btn-primary"
-            style={{ flex: '0 0 auto' }}
-            onClick={() => connect(url)}
-            disabled={isConnected || isConnecting}
+        {aiBuilding && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              background: 'rgba(0,0,0,0.65)',
+              backdropFilter: 'blur(4px)',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              borderRadius: 12,
+              gap: 12,
+            }}
           >
-            CONNECT
-          </button>
-          <button
-            className="btn-danger"
-            onClick={disconnect}
-            disabled={!isConnected}
-          >
-            DISCONNECT
-          </button>
-        </div>
-        <div className="status-row">
-          <div className={'status-dot ' + status} />
-          <span>{STATUS_LABELS[status] || 'DISCONNECTED'}</span>
-        </div>
-      </div>
-
-      <div className="metrics-grid">
-        <div className="metric">
-          <div className="metric-label">FACES DETECTED</div>
-          <div className="metric-value">{faceCount > 0 ? faceCount : '—'}</div>
-        </div>
-        <div className="metric">
-          <div className="metric-label">HAIRLINE POINTS</div>
-          <div className="metric-value">{totalPts > 0 ? totalPts : '—'}</div>
-        </div>
-        <div className="metric">
-          <div className="metric-label">CONFIDENCE</div>
-          <div className="metric-value">{avgConf != null ? (avgConf * 100).toFixed(1) + '%' : '—'}</div>
-        </div>
-        <div className="metric">
-          <div className="metric-label">눈썹 ↔ 헤어라인</div>
-          <div className="metric-value">{foreheadStr}</div>
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 14 }}>
-          <span>HAIRLINE POSITION</span>
-          <span>{hairlinePct != null ? hairlinePct + '%' : '—'}</span>
-        </div>
-        <div className="bar-track">
-          <div className="bar-fill" style={{ width: (hairlinePct ?? 0) + '%' }} />
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 14 }}>
-          <span>탈모 심각도</span>
-          <span>{d0?.severity ?? '—'}</span>
-        </div>
-        <div className="bar-track">
-          <div className="bar-fill" style={{ width: severityPct + '%', background: severityGrad }} />
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12, color: '#6b7280' }}>
-          <span>FOREHEAD RATIO</span>
-          <span>{d0?.forehead_ratio != null ? d0.forehead_ratio.toFixed(2) : '—'}</span>
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ fontSize: 14, marginBottom: 8 }}>Frame Rate</div>
-        <div style={{ position: 'relative', height: 60 }}>
-          <canvas ref={fpsCanvasRef} style={{ width: '100%', height: 60, borderRadius: 4 }} />
-          <div style={{ position: 'absolute', top: 8, left: 12, fontSize: 20, fontWeight: 'bold', color: '#3b82f6' }}>
-            {fps} fps
+            <div className="cam-spinner" />
+            <div style={{ fontSize: 15, fontWeight: 600 }}>AI가 리포트를 작성하고 있어요…</div>
+            <div style={{ fontSize: 12, opacity: 0.75 }}>최대 30초 정도 걸려요</div>
           </div>
-        </div>
-      </div>
+        )}
 
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ fontSize: 14, marginBottom: 12 }}>Detections</div>
-        <div className="det-list">
-          {detections.length === 0 ? (
-            <div style={{ color: '#6b7280', textAlign: 'center' }}>스트림 대기 중 …</div>
-          ) : (
-            detections.map((d) => {
-              const [x1, y1, x2, y2] = d.bbox || [0, 0, 0, 0]
-              const w = x2 - x1
-              const h = y2 - y1
-              const posStr = d.hairline_y_normalized != null
-                ? (d.hairline_y_normalized * 100).toFixed(1) + '%'
-                : '—'
-              return (
-                <div className="det-card" key={d.id}>
-                  <div className="det-header">
-                    <span className="det-id">FACE #{d.id}</span>
-                    <span className="det-conf">{(d.confidence * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="det-row"><span>BBox</span><span>{w}×{h}px</span></div>
-                  <div className="det-row"><span>Position</span><span>{x1}, {y1}</span></div>
-                  <div className="det-row"><span>Hairline pts</span><span>{d.hairline_points}</span></div>
-                  <div className="det-row"><span>Hairline Y</span><span>{posStr}</span></div>
-                </div>
-              )
-            })
-          )}
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ fontSize: 14, marginBottom: 12 }}>Log</div>
-        <div className="log-wrap">
-          {logs.map((l) => (
-            <div key={l.id} className={'log-entry ' + l.type}>
-              [{l.ts}] {l.msg}
+        {frameSrc && !aiBuilding && (
+          <div
+            style={{
+              position: 'absolute',
+              left: 16,
+              right: 16,
+              bottom: 16,
+              padding: '10px 14px',
+              background: 'rgba(0,0,0,0.55)',
+              backdropFilter: 'blur(6px)',
+              borderRadius: 10,
+              color: '#fff',
+              pointerEvents: 'none',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6, opacity: 0.85 }}>
+              <span>{progress > 0 ? '정렬 유지 중…' : '얼굴을 가이드 안에 맞춰주세요'}</span>
+              <span>{progressPct}%</span>
             </div>
-          ))}
-        </div>
+            <div style={{ height: 6, background: 'rgba(255,255,255,0.2)', borderRadius: 3, overflow: 'hidden' }}>
+              <div
+                style={{
+                  width: progressPct + '%',
+                  height: '100%',
+                  background: progressPct >= 100
+                    ? 'linear-gradient(90deg, #00ffc8, #00c8ff)'
+                    : 'linear-gradient(90deg, #00c8ff, #3b82f6)',
+                  transition: 'width 80ms linear',
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="actions">
         <button className="btn-secondary" onClick={onPrev}>이전</button>
-        <button className="btn-primary" onClick={onNext}>리포트 보기</button>
       </div>
     </div>
   )
