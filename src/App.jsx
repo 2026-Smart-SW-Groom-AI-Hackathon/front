@@ -44,7 +44,12 @@ export default function App() {
         />
       )}
       {step === 3 && (
-        <StreamingPage onPrev={() => setStep(2)} onNext={() => setStep(4)} />
+        <StreamingPage
+          data={data}
+          score={score}
+          onPrev={() => setStep(2)}
+          onNext={() => setStep(4)}
+        />
       )}
       {step === 4 && (
         <ResultPage onRetake={reset} />
