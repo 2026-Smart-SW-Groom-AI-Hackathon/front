@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { useHairLensSocket } from '../hooks/useHairLensSocket.js'
 import { buildReport, STORAGE_KEY } from '../data.js'
 
@@ -17,7 +17,6 @@ function serializeSurvey(d) {
 
 export default function StreamingPage({ data, score, onPrev, onNext }) {
   const { status, frameSrc, lastSaved, auto, requestAIReport, connect } = useHairLensSocket()
-  const [aiBuilding, setAiBuilding] = useState(false)
   const progress = Math.max(0, Math.min(1, auto?.progress ?? 0))
   const progressPct = Math.round(progress * 100)
   const navigatedRef = useRef(false)
@@ -46,43 +45,36 @@ export default function StreamingPage({ data, score, onPrev, onNext }) {
 
     navigatedRef.current = true
     const measurement = { ...lastSaved, image_b64: imageB64 }
+    const survey = serializeSurvey(data)
 
+    // 1) 로컬 폴백을 즉시 저장하고 바로 다음 페이지로 이동
+    try {
+      const fallback = buildReport(data, score, measurement)
+      fallback._meta = { ...(fallback._meta || {}), source: 'local-fallback' }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(fallback))
+      if (typeof window !== 'undefined') window.__REPORT__ = fallback
+    } catch (e) {
+      console.warn('local report build failed', e)
+    }
+    onNext && onNext()
+
+    // 2) AI 리포트는 백그라운드로 받아서 도착하면 덮어쓰기
     ;(async () => {
-      setAiBuilding(true)
-      const survey = serializeSurvey(data)
-      // image_b64은 토큰 낭비라 AI 요청에선 제외
       const measurementForAI = { ...measurement }
       delete measurementForAI.image_b64
-
-      let report = null
       try {
         const ai = await requestAIReport(survey, measurementForAI)
         if (ai && typeof ai === 'object') {
-          report = { ...ai, image_b64: imageB64, _meta: { ...(ai._meta || {}), source: 'claude', survey_score: score } }
+          const report = { ...ai, image_b64: imageB64, _meta: { ...(ai._meta || {}), source: 'claude', survey_score: score } }
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(report))
+          if (typeof window !== 'undefined') {
+            window.__REPORT__ = report
+            window.dispatchEvent(new CustomEvent('report:updated', { detail: report }))
+          }
         }
       } catch (e) {
         console.warn('AI 리포트 요청 오류', e)
       }
-      if (!report) {
-        // 폴백: 로컬 빌드
-        try {
-          report = buildReport(data, score, measurement)
-          report._meta = { ...(report._meta || {}), source: 'local-fallback' }
-        } catch (e) {
-          console.warn('local report build failed', e)
-        }
-      }
-
-      try {
-        if (report) {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(report))
-          if (typeof window !== 'undefined') window.__REPORT__ = report
-        }
-      } catch (e) {
-        console.warn('report persist failed', e)
-      }
-      setAiBuilding(false)
-      onNext && onNext()
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastSaved])
@@ -108,29 +100,7 @@ export default function StreamingPage({ data, score, onPrev, onNext }) {
           )}
         </div>
 
-        {aiBuilding && (
-          <div
-            style={{
-              position: 'absolute',
-              inset: 0,
-              background: 'rgba(0,0,0,0.65)',
-              backdropFilter: 'blur(4px)',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: '#fff',
-              borderRadius: 12,
-              gap: 12,
-            }}
-          >
-            <div className="cam-spinner" />
-            <div style={{ fontSize: 15, fontWeight: 600 }}>AI가 리포트를 작성하고 있어요…</div>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>최대 30초 정도 걸려요</div>
-          </div>
-        )}
-
-        {frameSrc && !aiBuilding && (
+        {frameSrc && (
           <div
             style={{
               position: 'absolute',
